@@ -1,0 +1,260 @@
+#define BLYNK_PRINT Serial
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+#define BLYNK_TEMPLATE_ID "TMPL3evv5Nefj"
+#define BLYNK_TEMPLATE_NAME "Adaptive multicell battery"
+#define BLYNK_AUTH_TOKEN "89r2KqFSbgVzNFS3JOt1Y8tcL3ux3Jce"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <math.h>
+
+// WiFi
+char ssid[] = "Wokwi-GUEST";
+char pass[] = "";
+
+// LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Pins
+#define CELL1 34
+#define CELL2 35
+#define CELL3 32
+#define CELL4 33
+
+#define LED_PIN 2
+#define BUZZER 18
+#define RELAY 19
+
+#define LOW_VOLTAGE_THRESHOLD 1.5
+
+float cell[4];
+float avgV, minV, maxV, imbalance;
+String health;
+
+// Multi arrays
+int weakCells[4];
+int strongCells[4];
+int weakCount = 0;
+int strongCount = 0;
+
+BlynkTimer timer;
+
+// Read voltage (NO rounding)
+float readVoltage(int pin) {
+  return analogRead(pin) * (3.3 / 4095.0);
+}
+
+// Average
+float getAverage(float arr[], int n) {
+  float sum = 0;
+  for (int i = 0; i < n; i++) sum += arr[i];
+  return sum / n;
+}
+
+// Min
+float getMin(float arr[], int n) {
+  float minVal = arr[0];
+  for (int i = 1; i < n; i++) {
+    if (arr[i] < minVal) minVal = arr[i];
+  }
+  return minVal;
+}
+
+// Max
+float getMax(float arr[], int n) {
+  float maxVal = arr[0];
+  for (int i = 1; i < n; i++) {
+    if (arr[i] > maxVal) maxVal = arr[i];
+  }
+  return maxVal;
+}
+
+// Find weak cells
+void findWeakCells(float arr[], int n, float minVal) {
+  weakCount = 0;
+  for (int i = 0; i < n; i++) {
+    if (fabs(arr[i] - minVal) < 0.003) {
+      weakCells[weakCount++] = i + 1;
+    }
+  }
+}
+
+// Find strong cells
+void findStrongCells(float arr[], int n, float maxVal) {
+  strongCount = 0;
+  for (int i = 0; i < n; i++) {
+    if (fabs(arr[i] - maxVal) < 0.003) {
+      strongCells[strongCount++] = i + 1;
+    }
+  }
+}
+
+// Imbalance
+float getImbalance(float minV, float maxV, float avg) {
+  if (avg == 0) return 0;
+  return ((maxV - minV) / avg) * 100.0;
+}
+
+// Health
+String getHealth(float imbal) {
+  if (imbal < 2) return "Healthy";
+  else if (imbal < 5) return "Minor";
+  else if (imbal < 10) return "Critical";
+  else return "Failure";
+}
+
+// Balanced
+bool allCellsEqual(float arr[], int n) {
+  for (int i = 1; i < n; i++) {
+    if (fabs(arr[i] - arr[0]) > 0.003) return false;
+  }
+  return true;
+}
+
+// Low voltage
+bool isLowVoltage(float arr[], int n) {
+  for (int i = 0; i < n; i++) {
+    if (arr[i] < LOW_VOLTAGE_THRESHOLD) return true;
+  }
+  return false;
+}
+
+// MAIN ENGINE
+void batteryEngine() {
+
+  int pins[4] = {CELL1, CELL2, CELL3, CELL4};
+
+  for (int i = 0; i < 4; i++) {
+    cell[i] = readVoltage(pins[i]);
+  }
+
+  avgV = getAverage(cell, 4);
+  minV = getMin(cell, 4);
+  maxV = getMax(cell, 4);
+
+  findWeakCells(cell, 4, minV);
+  findStrongCells(cell, 4, maxV);
+
+  imbalance = getImbalance(minV, maxV, avgV);
+  health = getHealth(imbalance);
+
+  bool equalCells = allCellsEqual(cell, 4);
+  bool lowVoltage = isLowVoltage(cell, 4);
+
+  if (equalCells) {
+    weakCount = 0;
+    strongCount = 0;
+  }
+
+  // LCD 
+  lcd.setCursor(0, 0);
+  lcd.print("Avg:");
+  lcd.print(avgV, 2);
+  lcd.print("   ");
+
+  lcd.setCursor(0, 1);
+
+  if (lowVoltage) {
+    lcd.print("LOW VOLTAGE   ");
+  }
+  else if (equalCells) {
+    lcd.print("BALANCED/HEALTHY        ");
+  }
+  else {
+    lcd.print(health);
+    lcd.print("             ");
+  }
+
+  // FINAL CONTROL LOGIC
+  if (lowVoltage || health == "Critical" || health == "Failure") {
+
+    digitalWrite(LED_PIN, HIGH);
+    tone(BUZZER, 1000);
+    digitalWrite(RELAY, LOW);
+
+  } else {
+
+    digitalWrite(LED_PIN, LOW);
+    noTone(BUZZER);
+    digitalWrite(RELAY, HIGH);
+
+  }
+
+  // Blynk
+  Blynk.virtualWrite(V0, cell[0]);
+  Blynk.virtualWrite(V1, cell[1]);
+  Blynk.virtualWrite(V2, cell[2]);
+  Blynk.virtualWrite(V3, cell[3]);
+  Blynk.virtualWrite(V4, avgV);
+  Blynk.virtualWrite(V5, imbalance);
+
+  if (lowVoltage) {
+    Blynk.virtualWrite(V6, "LOW VOLTAGE!");
+  }
+  else if (equalCells) {
+    Blynk.virtualWrite(V6, "Balanced/Healthy");
+  }
+  else {
+    Blynk.virtualWrite(V6, health);
+  }
+
+  if (equalCells) {
+    Blynk.virtualWrite(V7, 0);
+    Blynk.virtualWrite(V8, 0);
+  }
+  else {
+    String weakStr = "";
+    for (int i = 0; i < weakCount; i++) {
+      weakStr += String(weakCells[i]);
+      if (i < weakCount - 1) weakStr += ",";
+    }
+
+    String strongStr = "";
+    for (int i = 0; i < strongCount; i++) {
+      strongStr += String(strongCells[i]);
+      if (i < strongCount - 1) strongStr += ",";
+    }
+
+    Blynk.virtualWrite(V7, weakStr);
+    Blynk.virtualWrite(V8, strongStr);
+  }
+
+  // Serial
+  Serial.println("\n==============================");
+  for (int i = 0; i < 4; i++) {
+    Serial.print("Cell ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(cell[i], 2);
+  }
+
+  Serial.print("Health: ");
+  Serial.println(health);
+
+  if (lowVoltage) Serial.println("⚠ LOW VOLTAGE");
+
+  Serial.println("==============================");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(RELAY, OUTPUT);
+
+  lcd.init();
+  lcd.backlight();
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  timer.setInterval(500L, batteryEngine);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+}
